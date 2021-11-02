@@ -3,6 +3,7 @@ import pandas as pd
 from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import seaborn as sns
 from matplotlib import gridspec
 import itertools
 import datetime
@@ -539,10 +540,10 @@ def calc_lift(df, pred, target, groupnum=None, range_col=None, title_name='lift'
     dfkslift[['total_distri']].plot(kind='bar', width=0.3, color=cm_light, ax=ax, legend=False)
     ax.set_ylabel('total_distri')
     ax_curve = ax.twinx()
-    dfkslift[['bad_distri']].plot(ax=ax_curve, marker='o', markersize=5, color=cm_dark, legend=False)
+    dfkslift[['badrate']].plot(ax=ax_curve, marker='o', markersize=5, color=cm_dark, legend=False)
     ax_curve.set_ylabel('1_distri')
     ax_curve.grid()
-    ax_curve.plot([0, groupnum - 1], [1/groupnum, 1/groupnum], 'r--')
+    ax_curve.plot([0, groupnum - 1], [dfkslift['cumbadrate'].iloc[-1], dfkslift['cumbadrate'].iloc[-1]], 'r--')
     ax.set_xticks(np.arange(groupnum))
     ax.set_xticklabels(dfkslift['range'].values, rotation=-20, horizontalalignment='left')
     ax.set_xlim([-0.5, groupnum - 0.5])
@@ -1636,7 +1637,8 @@ def monitor(all_df, combiners, features, target, cur_dir,
 #     target = y
 
     mpl.use('Agg') 
-    for col in features:
+    writer = pd.ExcelWriter(os.path.join(cur_dir, 'stats.xlsx'), engine='openpyxl')
+    for start_col_index, col in enumerate(features):
         fig = plt.figure(figsize=fig_size)
         gs = gridspec.GridSpec(len(plot_configs[0]), len(plot_configs), height_ratios=[height for height in plot_configs[0].values()]) 
         for combiner_index, (combiner, plot_config) in enumerate(zip(combiners, plot_configs)):
@@ -1648,11 +1650,23 @@ def monitor(all_df, combiners, features, target, cur_dir,
             nullrate_series = pd.Series()
             if expected[col].dtype == 'object':
                 bins_df[col] = bins_df[col].apply(lambda x: x[:10])
-                nullrate_series.loc[set_array[0]] = expected[(expected[col] == str(NA)) | (expected[col] == 'nan') |
-                                                     (expected[col].isnull())].shape[0] / expected.shape[0]
+                nullrate_series.loc[set_array[0]] = expected[(expected[col] == str(NA)) |
+                                                             (expected[col] == 'nan') |
+                                                             (expected[col].isnull())].shape[0] / expected.shape[0]
+                expected_bin_notnull = combiner.transform(expected[~((expected[col] == str(NA)) |
+                                                                     (expected[col] == 'nan') |
+                                                                     (expected[col].isnull()))][[col, target]],
+                                                          labels=True)
             else:
                 nullrate_series.loc[set_array[0]] = expected[(expected[col] == NA) |
-                                                     (expected[col].isnull())].shape[0] / expected.shape[0]    
+                                                             (expected[col].isnull())].shape[0] / expected.shape[0]
+                expected_bin_notnull = combiner.transform(expected[~((expected[col] == NA) |
+                                                                   (expected[col].isnull()))][[col, target]],
+                                                          labels=True)
+            bins_df_notnull = bin_bad_rate(expected_bin_notnull, col, target)
+            bins_df_notnull = bins_df_notnull.set_index(col)
+            expected_count_ratio = bins_df_notnull['bin_total'] / bins_df_notnull['bin_total'].sum()
+            expected_bad_ratio = bins_df_notnull['bin_bad'] / bins_df_notnull['bin_bad'].sum()
             bins_df = bins_df.set_index(col)
             badrate_df = pd.DataFrame(columns=bins_df.index)
             badrate_df.loc[set_array[0], bins_df.index] = bins_df.bin_bad_rate
@@ -1666,6 +1680,8 @@ def monitor(all_df, combiners, features, target, cur_dir,
             total_series.loc[set_array[0]] = bins_df['bin_total'].sum()
             psi_series = pd.Series()
             psi_series.loc[set_array[0]] = np.nan
+            psi_positive_series = pd.Series()
+            psi_positive_series.loc[set_array[0]] = np.nan
             iv_series = pd.Series()
             iv_series.loc[set_array[0]] = toad.stats.IV(expected_bin[col], expected_bin[target])
             for i in range(1, len(set_array)):
@@ -1676,11 +1692,23 @@ def monitor(all_df, combiners, features, target, cur_dir,
                 assert(actual.shape[0] == bins_df['bin_total'].sum())
                 if actual[col].dtype == 'object':
                     bins_df[col] = bins_df[col].apply(lambda x: x[:10])
-                    nullrate_series.loc[set_array[i]] = actual[(actual[col] == str(NA)) | (expected[col] == 'nan') |
-                                                   (actual[col].isnull())].shape[0] / actual.shape[0]
+                    nullrate_series.loc[set_array[i]] = actual[(actual[col] == str(NA)) |
+                                                               (expected[col] == 'nan') |
+                                                               (actual[col].isnull())].shape[0] / actual.shape[0]
+                    actual_bin_notnull = combiner.transform(actual[~((actual[col] == str(NA)) |
+                                                                   (expected[col] == 'nan') |
+                                                                   (actual[col].isnull()))][[col, target]],
+                                                            labels=True)
                 else:
                     nullrate_series.loc[set_array[i]] = actual[(actual[col] == NA) |
-                                                   (actual[col].isnull())].shape[0] / actual.shape[0]
+                                                               (actual[col].isnull())].shape[0] / actual.shape[0]
+                    actual_bin_notnull = combiner.transform(actual[~((actual[col] == NA) |
+                                                                   (actual[col].isnull()))][[col, target]],
+                                                            labels=True)
+                bins_df_notnull = bin_bad_rate(actual_bin_notnull, col, target)
+                bins_df_notnull = bins_df_notnull.set_index(col)
+                actual_count_ratio = bins_df_notnull['bin_total'] / bins_df_notnull['bin_total'].sum()
+                actual_bad_ratio = bins_df_notnull['bin_bad'] / bins_df_notnull['bin_bad'].sum()
                 bins_df = bins_df.set_index(col)
                 # newly added
                 badrate_df = check_columns(badrate_df, bins_df)
@@ -1699,18 +1727,41 @@ def monitor(all_df, combiners, features, target, cur_dir,
                 # newly ----
                 lift_df.loc[set_array[i], bins_df.index] = (bins_df.bin_bad / bins_df.bin_bad.sum()) / (bins_df.bin_total / bins_df.bin_total.sum())
                 total_series.loc[set_array[i]] = bins_df['bin_total'].sum()
-                psi_series.loc[set_array[i]] = toad.metrics.PSI(expected_bin[col], actual_bin[col])
+                psi_series.loc[set_array[i]] = np.sum((expected_count_ratio - actual_count_ratio) *
+                                                      np.log(expected_count_ratio / actual_count_ratio))
+                psi_positive_series.loc[set_array[i]] = np.sum((expected_bad_ratio - actual_bad_ratio) *
+                                                               np.log(expected_bad_ratio / actual_bad_ratio))
                 iv_series.loc[set_array[i]] = toad.stats.IV(actual_bin[col], actual_bin[target]) 
 
             plot_dict['total_series'] = (total_series, 'single', col+'_total')
             plot_dict['nullrate_series'] = (nullrate_series, 'single', col+'_nullrate')
             plot_dict['psi_series'] = (psi_series, 'single', col+'_psi')
+            plot_dict['psi_positive_series'] = (psi_positive_series, 'single', col+'_psi_p')
             plot_dict['iv_series'] = (iv_series, 'single', col+'_iv')
             plot_dict['countratio_df'] = (countratio_df, 'stacked_bins', col+'_countratio')
             plot_dict['badrate_df'] = (badrate_df, 'multiple', col+'_1prob')
             plot_dict['lift_df'] = (lift_df, 'multiple', col+'_liftratio')
             plot_dict['woe_df'] = (woe_df, 'multiple', col+'_woe')
             plot_dict['mixed'] = ((countratio_df, badrate_df), 'mixed', (col+'_bin', 'count_ratio', 'badrate'))
+
+            for key, item in plot_dict.items():
+                if key == 'mixed':
+                    continue
+                if isinstance(item[0], pd.DataFrame):
+                    temp_df = item[0]
+                    temp_df.columns = [col + '_' + temp_col_name for temp_col_name in temp_df.columns]
+                    startcol = start_col_index * 6
+                    selected_columns = [temp_col_name for temp_col_name in temp_df.columns if temp_col_name.find('.nan') < 0]
+                    headtail_df = temp_df[selected_columns]
+                    head_df = headtail_df.iloc[:, 0]
+                    tail_df = headtail_df.iloc[:, -1]
+                    head_df.to_excel(writer, sheet_name=key + '_head_combiner' + str(combiner_index), startcol=start_col_index, index=False)
+                    tail_df.to_excel(writer, sheet_name=key + '_tail_combiner' + str(combiner_index), startcol=start_col_index, index=False)
+                else:
+                    temp_df = pd.DataFrame(item[0])
+                    temp_df.columns = [col]
+                    startcol = start_col_index
+                temp_df.to_excel(writer, sheet_name=key + '_combiner' + str(combiner_index), startcol=startcol, index=False)
 
             config_length = len(plot_config)
             plot_setting = []
@@ -1769,3 +1820,4 @@ def monitor(all_df, combiners, features, target, cur_dir,
         save_dir = os.path.join(cur_dir, col+'_stats.jpg')
         fig.savefig(save_dir, bbox_inches='tight')
         plt.close('all')
+    writer.save()

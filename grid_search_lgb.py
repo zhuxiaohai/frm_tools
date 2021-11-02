@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from scipy import special, optimize
 import matplotlib.pyplot as plt
 from operator import gt, lt
 
@@ -12,7 +13,7 @@ from lightgbm.basic import _ConfigAliases, _log_info, _log_warning
 from lightgbm.callback import EarlyStopException, _format_eval_result
 
 from sklearn.model_selection import PredefinedSplit,  StratifiedKFold
-from sklearn.metrics import f1_score, roc_curve
+from sklearn.metrics import f1_score, roc_curve, roc_auc_score
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -251,43 +252,86 @@ def my_early_stopping(stopping_rounds, w=0.2, verbose=True, period=1, show_stdv=
     return _callback
 
 
+class FocalLoss:
+    def __init__(self, gamma, alpha=None):
+        # 使用FocalLoss只需要设定以上两个参数,如果alpha=None,默认取值为1
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def at(self, y):
+        # alpha 参数, 根据FL的定义函数,正样本权重为self.alpha,负样本权重为1 - self.alpha
+        if (self.alpha is None) or (self.alpha == 1):
+            return np.ones_like(y)
+        return np.where(y, self.alpha, 1 - self.alpha)
+
+    def pt(self, y, p):
+        # pt和p的关系
+        p = np.clip(p, 1e-15, 1 - 1e-15)
+        return np.where(y, p, 1 - p)
+
+    def __call__(self, y_true, y_pred):
+        # 即FL的计算公式
+        at = self.at(y_true)
+        pt = self.pt(y_true, y_pred)
+        return -at * (1 - pt) ** self.gamma * np.log(pt)
+
+    def grad(self, y_true, y_pred):
+        # 一阶导数
+        y = 2 * y_true - 1  # {0, 1} -> {-1, 1}
+        at = self.at(y_true)
+        pt = self.pt(y_true, y_pred)
+        g = self.gamma
+        return at * y * (1 - pt) ** g * (g * pt * np.log(pt) + pt - 1)
+
+    def hess(self, y_true, y_pred):
+        # 二阶导数
+        y = 2 * y_true - 1  # {0, 1} -> {-1, 1}
+        at = self.at(y_true)
+        pt = self.pt(y_true, y_pred)
+        g = self.gamma
+
+        u = at * y * (1 - pt) ** g
+        du = -at * y * g * (1 - pt) ** (g - 1)
+        v = g * pt * np.log(pt) + pt - 1
+        dv = g * np.log(pt) + g + 1
+
+        return (du * v + u * dv) * y * (pt * (1 - pt))
+
+    def init_score(self, y_true):
+        # 样本初始值寻找过程
+        res = optimize.minimize_scalar(
+            lambda p: self(y_true, p).sum(),
+            bounds=(0, 1),
+            method='bounded'
+        )
+        p = res.x
+        log_odds = np.log(p / (1 - p))
+        return log_odds
+
+    def get_loss(self, preds, train_data):
+        # preds: The predicted values. Predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task.
+        y = train_data.get_label()
+        p = special.expit(preds)
+        return self.grad(y, p), self.hess(y, p)
+
+    def eval_focal_loss(self, preds, train_data):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        y = train_data.get_label()
+        p = special.expit(preds)
+        is_higher_better = False
+        return 'focal_loss', self(y, p).mean(), is_higher_better
+
+
 class Objective(object):
-    def __init__(self,
-                 dtrain, cv, folds, metric, optimization_direction,
-                 feval, eval_metric_list, coef_train_val_disparity,
-                 tuning_param_dict, max_boosting_rounds, early_stop,
-                 random_state):
-        """ objective will be called once in a trial
-        dtrain: xgbdmatrix for train_val
-        cv: int, number of stratified folds
-        folds:  of list of k tuples (in ,out) for cv, where 'in' is a list of indices into dtrain
-                    for training in the ith cv and 'out' is a list of indices into dtrain
-                    for validation in the ith cv
-                when folds is defined, cv will not be used
-        metric: str, the metric to optimize
-        optimization_direction: str, 'maximize' or 'minimize'
-        feval: callable, custom metric fuction for monitor
-        eval_metric_list: a list of str, metrics for monitor
-        coef_train_val_disparity: float, coefficient for train_val balance
-        tuning_param_dict: dict
-        max_boosting_rounds: int, max number of trees in a trial of a set of parameters
-        early_stop: int, number of rounds(trees) for early stopping
-        random_state: int
-        """
-        self.dtrain = dtrain
-        self.cv = cv
-        self.folds = folds
-        self.feval = feval
-        self.eval_metric_list = eval_metric_list
-        self.coef_train_val_disparity = coef_train_val_disparity
-        self.metric = 'auc' if metric == 'roc_auc' else metric
-        self.max_boosting_rounds = max_boosting_rounds
-        self.early_stop_rounds = early_stop
-        self.random_state = random_state
-        self.maximize = True if optimization_direction == 'maximize' else False
+    def __init__(self, tuning_param_dict, train_set, monitor, coef_train_val_disparity, callbacks, **kwargs):
         self.tuning_param_dict = tuning_param_dict
-        self.dynamic_params = []
-        self.static_params = []
+        self.train_set = train_set
+        self.monitor = monitor
+        self.coef_train_val_disparity = coef_train_val_disparity
+        self.callbacks = callbacks
+        self.kwargs = kwargs
 
     def __call__(self, trial):
         trial_param_dict = {}
@@ -296,13 +340,28 @@ class Objective(object):
             suggest_type = param[0]
             suggest_param = param[1]
             trial_param_dict['boosting'] = eval('trial.suggest_' + suggest_type)('boosting', **suggest_param)
-            self.dynamic_params.append('boosting')
         elif param is not None:
             trial_param_dict['boosting'] = param
-            self.static_params.append('boosting')
         booster = trial_param_dict.get('boosting')
+
+        if self.tuning_param_dict.get('fobj', None) is not None:
+            fobj_class = self.tuning_param_dict.get('fobj')[0]
+            fobj_trial_param_dict = {}
+            for key, param in self.tuning_param_dict.get('fobj')[1].items():
+                if isinstance(param, tuple):
+                    suggest_type = param[0]
+                    suggest_param = param[1]
+                    fobj_trial_param_dict[key] = eval('trial.suggest_' + suggest_type)(key, **suggest_param)
+                else:
+                    fobj_trial_param_dict[key] = param
+            fobj_instance = fobj_class(**fobj_trial_param_dict)
+            fobj = fobj_instance.get_loss
+            self.train_set.set_init_score(np.full_like(self.train_set.get_label(),
+                                          fobj_instance.init_score(self.train_set.get_label()),
+                                          dtype=float))
+
         for key, param in self.tuning_param_dict.items():
-            if key == 'boosting':
+            if (key == 'boosting') or (key == 'fobj'):
                 continue
             if (booster is None) or (booster != 'dart'):
                 if key in ['uniform_drop', 'rate_drop', 'skip_drop']:
@@ -311,36 +370,35 @@ class Objective(object):
                 suggest_type = param[0]
                 suggest_param = param[1]
                 trial_param_dict[key] = eval('trial.suggest_' + suggest_type)(key, **suggest_param)
-                self.dynamic_params.append(key)
             else:
                 trial_param_dict[key] = param
-                self.static_params.append(key)
 
-        earlystopping = my_early_stopping(self.early_stop_rounds,
-                                          self.coef_train_val_disparity,
-                                          verbose=True if self.tuning_param_dict.get('verbosity', 0) > 0 else False)
-        pruning = LightGBMPruningCallback(trial, 'valid '+self.metric)
-
+        callbacks = [callback_class(**callback_param) for callback_class, callback_param in self.callbacks]
+        callbacks.append(LightGBMPruningCallback(trial, 'valid '+self.monitor))
         # when folds is defined in xgb.cv, nfold will not be used
-        cvresult = lgb.cv(params=trial_param_dict,
-                          train_set=self.dtrain,
-                          num_boost_round=self.max_boosting_rounds,
-                          folds=self.folds,
-                          nfold=self.cv,
-                          metrics=self.eval_metric_list,
-                          feval=self.feval,
-                          seed=self.random_state,
-                          eval_train_metric=True,
-                          shuffle=False,
-                          stratified=False,
-                          callbacks=[pruning, earlystopping],
-                          )
-        n_iterations = len(cvresult['valid ' + self.metric + '-mean'])
-        val_score = cvresult['valid ' + self.metric + '-mean'][-1]
-        train_score = cvresult['train ' + self.metric + '-mean'][-1]
+        if self.tuning_param_dict.get('fobj', None) is None:
+            cvresult = lgb.cv(params=trial_param_dict,
+                              train_set=self.train_set,
+                              eval_train_metric=True,
+                              callbacks=callbacks,
+                              **self.kwargs
+                              )
+        else:
+            cvresult = lgb.cv(params=trial_param_dict,
+                              train_set=self.train_set,
+                              fobj=fobj,
+                              eval_train_metric=True,
+                              callbacks=callbacks,
+                              **self.kwargs
+                              )
+
+        n_iterations = len(cvresult['valid ' + self.monitor + '-mean'])
         trial.set_user_attr("n_iterations", n_iterations)
-        trial.set_user_attr("val_score", val_score)
-        trial.set_user_attr("train_score", train_score)
+
+        val_score = cvresult['valid ' + self.monitor + '-mean'][-1]
+        train_score = cvresult['train ' + self.monitor + '-mean'][-1]
+        trial.set_user_attr("val_score_{}".format(self.monitor), val_score)
+        trial.set_user_attr("train_score_{}".format(self.monitor), train_score)
         if self.coef_train_val_disparity > 0:
             best_score = train_val_score(train_score, val_score, self.coef_train_val_disparity)
         else:
@@ -349,10 +407,26 @@ class Objective(object):
 
 
 class OptunaSearchLGB(object):
-    def __init__(self):
+    def __init__(self, monitor, optimization_direction='maximize', coef_train_val_disparity=0.2, callbacks=[],
+                 n_startup_trials=20, n_warmup_steps=20, interval_steps=1,
+                 pruning_percentile=75, maximum_time=60*10, n_trials=100, random_state=2, optuna_verbosity=1):
+        self.monitor = monitor
+        self.optimization_direction = optimization_direction
+        self.coef_train_val_disparity = coef_train_val_disparity
+        self.callbacks = callbacks
+        self.n_startup_trials = n_startup_trials
+        self.n_warmup_steps = n_warmup_steps
+        self.interval_steps = interval_steps
+        self.pruning_percentile = pruning_percentile
+        self.maximum_time = maximum_time
+        self.n_trials = n_trials
+        self.random_state = random_state
+        self.optuna_verbosity = optuna_verbosity
         self.study = None
-        self.static_param = {}
-        self.dynamic_param = {}
+        self.dynamic_params = {}
+        self.static_params = {}
+        self.fobj_dynamic_params = {}
+        self.fobj_static_params = {}
 
     def get_params(self):
         """
@@ -364,9 +438,14 @@ class OptunaSearchLGB(object):
         if self.study:
             best_trial = self.study.best_trial
             best_param = best_trial.params
-            best_param.update(best_trial.user_attrs)
-            best_param.update(self.static_param)
-            return best_param
+
+            output_param = {key: best_param[key] for key in best_param.keys() if key in self.dynamic_params}
+            output_param.update(self.static_params)
+
+            output_fobj_param = {key: best_param[key] for key in best_param.keys() if key in self.fobj_dynamic_params}
+            output_fobj_param.update(self.fobj_static_params)
+
+            return output_param, output_fobj_param, best_trial.user_attrs
         else:
             return None
 
@@ -391,44 +470,34 @@ class OptunaSearchLGB(object):
         if self.study:
             return optuna.visualization.plot_param_importances(self.study, params=names)
 
-    def search(self, x_train, y_train, tuning_param_dict, cv=3,
-               eval_set=None, eval_metric=['roc_auc', 'ks'], optimization_direction='maximize',
-               coef_train_val_disparity=0.2, maximum_boosting_rounds=1000, early_stopping_rounds=10,
-               n_startup_trials=20, n_warmup_steps=20, interval_steps=1, pruning_percentile=75,
-               maximum_time=60*10, n_trials=100, random_state=2, optuna_verbosity=1):
-        for key, param in tuning_param_dict.items():
-            if not isinstance(param, tuple):
-                self.static_param[key] = param
+    def search(self, params, train_set, **kwargs):
+        for key, param in params.items():
+            if key == 'fobj':
+                for fobj_key, fobj_param in param[1].items():
+                    if not isinstance(fobj_param, tuple):
+                        self.fobj_static_params[fobj_key] = fobj_param
+                    else:
+                        self.fobj_dynamic_params[fobj_key] = fobj_param
             else:
-                self.dynamic_param[key] = param
+                if not isinstance(param, tuple):
+                    self.static_params[key] = param
+                else:
+                    self.dynamic_params[key] = param
 
-        feval, eval_metric_list = regularize_metric(eval_metric)
-        x_train_val, y_train_val, cv, folds = make_train_val(x_train, y_train,
-                                                             eval_set, cv,
-                                                             random_state)
-        xgb_dmatrix = lgb.Dataset(x_train_val, label=y_train_val)
-        objective = Objective(dtrain=xgb_dmatrix,
-                              cv=cv,
-                              folds=folds,
-                              metric=eval_metric[-1],
-                              optimization_direction=optimization_direction,
-                              feval=feval,
-                              eval_metric_list=eval_metric_list,
-                              coef_train_val_disparity=coef_train_val_disparity,
-                              tuning_param_dict=tuning_param_dict,
-                              max_boosting_rounds=maximum_boosting_rounds,
-                              early_stop=early_stopping_rounds,
-                              random_state=random_state)
-        if optuna_verbosity == 0:
+        kwargs.pop('callbacks', None)
+        kwargs.pop('eval_train_metric', None)
+        objective = Objective(params, train_set, self.monitor, self.coef_train_val_disparity, self.callbacks, **kwargs)
+        if self.optuna_verbosity == 0:
             optuna.logging.set_verbosity(optuna.logging.WARNING)
-        sampler = optuna.samplers.TPESampler(seed=random_state)
+
+        sampler = optuna.samplers.TPESampler(seed=self.random_state)
         # prune a step(a boosting round) if it's worse than the bottom (1 - percentile) in history
-        pruner = optuna.pruners.PercentilePruner(percentile=pruning_percentile,
-                                                 n_warmup_steps=n_warmup_steps,
-                                                 interval_steps=interval_steps,
-                                                 n_startup_trials=n_startup_trials)
-        study = optuna.create_study(direction=optimization_direction, sampler=sampler, pruner=pruner)
-        study.optimize(objective, timeout=maximum_time, n_trials=n_trials, n_jobs=1)
+        pruner = optuna.pruners.PercentilePruner(percentile=self.pruning_percentile,
+                                                 n_warmup_steps=self.n_warmup_steps,
+                                                 interval_steps=self.interval_steps,
+                                                 n_startup_trials=self.n_startup_trials)
+        study = optuna.create_study(direction=self.optimization_direction, sampler=sampler, pruner=pruner)
+        study.optimize(objective, timeout=self.maximum_time, n_trials=self.n_trials, n_jobs=1)
         self.study = study
         print("Number of finished trials: ", len(study.trials))
 
@@ -438,16 +507,64 @@ def test_optuna():
         fpr, tpr, _ = roc_curve(y_true, y_pred, **kwargs)
         ks_value = max(tpr - fpr)
         return ks_value
+
+    def eval_ks(y_pred, y_true_dmatrix):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        def ks_stats(y_true, y_pred, **kwargs):
+            fpr, tpr, _ = roc_curve(y_true, y_pred, **kwargs)
+            ks_value = max(tpr - fpr)
+            return ks_value
+        y_true = y_true_dmatrix.get_label()
+        y_pred = special.expit(y_pred)
+        ks = ks_stats(y_true, y_pred)
+        return 'ks_score', ks, True
+
+    def eval_auc(y_pred, y_true_dmatrix):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        def auc_stats(y_true, y_pred, **kwargs):
+            auc = roc_auc_score(y_true, y_pred, **kwargs)
+            return auc
+        y_true = y_true_dmatrix.get_label()
+        y_pred = special.expit(y_pred + FocalLoss(2, 0.25).init_score(y_train_val))
+        auc = auc_stats(y_true, y_pred)
+        return 'auc_score', auc, True
+
+    def eval_top(preds, train_data):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        preds = special.expit(preds)
+        labels = train_data.get_label()
+        auc = roc_auc_score(labels, preds)
+        dct = pd.DataFrame({'pred': preds, 'percent': preds, 'labels': labels})
+        key = dct['percent'].quantile(0.05)
+        dct['percent'] = dct['percent'].map(lambda x: 1 if x >= key else 0)
+        result = np.mean(dct[dct.percent == 1]['labels'] == 1) * 0.2 + auc * 0.8
+        return 'top_positive_ratio', result, True
+
     from sklearn.datasets import load_breast_cancer
     from sklearn.model_selection import train_test_split
     X, y = load_breast_cancer(return_X_y=True)
     x_train, x_valid, y_train, y_valid = train_test_split(X, y, random_state=0)
-    op = OptunaSearchLGB()
-    tuning_param_dict = {'objective': 'binary',
+
+    feval=[eval_auc, eval_ks, eval_top]
+    # eval_metric = ['roc_auc', 'ks']
+    # feval, eval_metric_list = regularize_metric(eval_metric)
+    x_train_val, y_train_val, cv, folds = make_train_val(x_train, y_train, [(x_valid, y_valid)], cv=1, random_state=5)
+    dmatrix = lgb.Dataset(x_train_val, label=y_train_val)
+    op = OptunaSearchLGB('top_positive_ratio',
+                         optimization_direction='maximize', coef_train_val_disparity=0,
+                         callbacks=[(my_early_stopping, {'stopping_rounds': 10, 'w': 0, 'verbose': True})],
+                         n_trials=30)
+    tuning_param_dict = {
+                         # 'objective': 'binary',
+                         'fobj': (FocalLoss, {'gamma': ('float', {'low': 1, 'high': 3, 'step': 1}),
+                                              'alpha': ('float', {'low': 0.1, 'high': 0.8, 'step': 0.1})}),
                          'verbosity': -1,
                          'seed': 2,
                          'deterministic': True,
-                         'boosting': ('categorical', {'choices': ['gbdt', 'dart']}),
+                         'boosting': 'gbdt',
                          'eta': ('discrete_uniform', {'low': 0.07, 'high': 1.2, 'q': 0.01}),
                          'max_depth': ('int', {'low': 2, 'high': 6}),
                          'reg_lambda': ('int', {'low': 1, 'high': 20}),
@@ -460,23 +577,264 @@ def test_optuna():
                          'subsample_freq': ('int', {'low': 1, 'high': 10}),
                          'rate_drop': ('float', {'low': 1e-8, 'high': 1.0, 'log': True}),
                          'skip_drop': ('float', {'low': 1e-8, 'high': 1.0, 'log': True}),
-                         'uniform_drop': ('categorical', {'choices': [True, False]})}
-    op.search(x_train, y_train, tuning_param_dict, cv=1, coef_train_val_disparity=0,
-              eval_set=[(x_valid, y_valid)], optuna_verbosity=1, early_stopping_rounds=10,
-              n_warmup_steps=5, n_trials=20)
-    train_dmatrix = lgb.Dataset(x_train, label=y_train)
-    test_dmatrix = lgb.Dataset(x_valid, label=y_valid)
+                         'uniform_drop': ('categorical', {'choices': [True, False]})
+    }
+    op.search(tuning_param_dict, dmatrix,
+              folds=folds, nfold=cv, shuffle=False, stratified=False, feval=feval)
     train_param = op.get_params()
     print(train_param)
-    afsxc = lgb.train(train_param, train_dmatrix, num_boost_round=train_param['n_iterations'],
-                      valid_sets=[train_dmatrix, test_dmatrix], valid_names=['train', 'val'], feval=custom_ks_score)
+    fl = FocalLoss(**train_param[1])
+    init_score = fl.init_score(y_train_val)
+    print(init_score)
+    train_dmatrix = lgb.Dataset(x_train, label=y_train, reference=dmatrix,
+                                init_score=np.full_like(y_train, init_score, dtype=float))
+    test_dmatrix = lgb.Dataset(x_valid, label=y_valid,
+                               reference=dmatrix, init_score=np.full_like(y_valid, init_score, dtype=float))
+
+    afsxc = lgb.train(train_param[0], train_dmatrix,
+                      num_boost_round=train_param[2]['n_iterations'], fobj=fl.get_loss,
+                      valid_sets=[train_dmatrix, test_dmatrix], valid_names=['train', 'val'], feval=feval)
+    train_pred = special.expit(init_score + afsxc.predict(x_train))
+    print("train ks {} auc {}".format(ks_stats(y_train, train_pred), roc_auc_score(y_train, train_pred)))
+    test_pred = special.expit(init_score + afsxc.predict(x_valid))
+    print("test ks {} auc {}".format(ks_stats(y_valid, test_pred), roc_auc_score(y_valid, test_pred)))
+
+
+def test_optuna_common():
+    def ks_stats(y_true, y_pred, **kwargs):
+        fpr, tpr, _ = roc_curve(y_true, y_pred, **kwargs)
+        ks_value = max(tpr - fpr)
+        return ks_value
+
+    def eval_ks(y_pred, y_true_dmatrix):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        def ks_stats(y_true, y_pred, **kwargs):
+            fpr, tpr, _ = roc_curve(y_true, y_pred, **kwargs)
+            ks_value = max(tpr - fpr)
+            return ks_value
+        y_true = y_true_dmatrix.get_label()
+        y_pred = special.expit(y_pred)
+        ks = ks_stats(y_true, y_pred)
+        return 'ks_score', ks, True
+
+    def eval_auc(y_pred, y_true_dmatrix):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        def auc_stats(y_true, y_pred, **kwargs):
+            auc = roc_auc_score(y_true, y_pred, **kwargs)
+            return auc
+        y_true = y_true_dmatrix.get_label()
+        y_pred = special.expit(y_pred + FocalLoss(2, 0.25).init_score(y_train_val))
+        auc = auc_stats(y_true, y_pred)
+        return 'auc_score', auc, True
+
+    def eval_top(preds, train_data):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        preds = special.expit(preds)
+        labels = train_data.get_label()
+        auc = roc_auc_score(labels, preds)
+        dct = pd.DataFrame({'pred': preds, 'percent': preds, 'labels': labels})
+        key = dct['percent'].quantile(0.05)
+        dct['percent'] = dct['percent'].map(lambda x: 1 if x >= key else 0)
+        result = np.mean(dct[dct.percent == 1]['labels'] == 1) * 0.2 + auc * 0.8
+        return 'top_positive_ratio', result, True
+
+    from sklearn.datasets import load_breast_cancer
+    from sklearn.model_selection import train_test_split
+    X, y = load_breast_cancer(return_X_y=True)
+    x_train, x_valid, y_train, y_valid = train_test_split(X, y, random_state=0)
+
+    feval=[eval_auc, eval_ks, eval_top]
+    # eval_metric = ['roc_auc', 'ks']
+    # feval, eval_metric_list = regularize_metric(eval_metric)
+    x_train_val, y_train_val, cv, folds = make_train_val(x_train, y_train, [(x_valid, y_valid)], cv=1, random_state=5)
+    dmatrix = lgb.Dataset(x_train_val, label=y_train_val)
+    op = OptunaSearchLGB('top_positive_ratio',
+                         optimization_direction='maximize', coef_train_val_disparity=0,
+                         callbacks=[(my_early_stopping, {'stopping_rounds': 10, 'w': 0, 'verbose': True})],
+                         n_trials=3)
+    tuning_param_dict = {
+                         'objective': 'binary',
+                         'verbosity': 1,
+                         'seed': 2,
+                         'deterministic': True,
+                         'boosting': 'gbdt',
+                         'eta': ('discrete_uniform', {'low': 0.07, 'high': 1.2, 'q': 0.01}),
+                         'max_depth': ('int', {'low': 2, 'high': 6}),
+                         'reg_lambda': ('int', {'low': 1, 'high': 20}),
+                         'reg_alpha': ('int', {'low': 1, 'high': 20}),
+                         'min_gain_to_split': ('int', {'low': 0, 'high': 3}),
+                         'min_child_weight': ('int', {'low': 1, 'high': 30}),
+                         'colsample_bytree': ('discrete_uniform', {'low': 0.7, 'high': 1, 'q': 0.05}),
+                         'colsample_bynode': ('discrete_uniform', {'low': 0.7, 'high': 1, 'q': 0.05}),
+                         'subsample': ('discrete_uniform', {'low': 0.7, 'high': 0.95, 'q': 0.05}),
+                         'subsample_freq': ('int', {'low': 1, 'high': 10}),
+                         'rate_drop': ('float', {'low': 1e-8, 'high': 1.0, 'log': True}),
+                         'skip_drop': ('float', {'low': 1e-8, 'high': 1.0, 'log': True}),
+                         'uniform_drop': ('categorical', {'choices': [True, False]})
+    }
+    op.search(tuning_param_dict, dmatrix,
+              folds=folds, nfold=cv, shuffle=False, stratified=False, feval=feval)
+    train_param = op.get_params()
+    print(train_param)
+    train_dmatrix = lgb.Dataset(x_train, label=y_train, reference=dmatrix)
+    test_dmatrix = lgb.Dataset(x_valid, label=y_valid, reference=dmatrix)
+
+    afsxc = lgb.train(train_param[0], train_dmatrix,
+                      num_boost_round=train_param[2]['n_iterations'],
+                      valid_sets=[train_dmatrix, test_dmatrix], valid_names=['train', 'val'], feval=feval)
     train_pred = afsxc.predict(x_train)
-    print("train_data_ks", ks_stats(y_train, train_pred))
+    print("train ks {} auc {}".format(ks_stats(y_train, train_pred), roc_auc_score(y_train, train_pred)))
     test_pred = afsxc.predict(x_valid)
-    print("test_data_ks", ks_stats(y_valid, test_pred))
-    op.plot_optimization().show()
-    op.plot_importance(list(op.study.trials[0].params.keys())).show()
-    op.plot_score()
+    print("test ks {} auc {}".format(ks_stats(y_valid, test_pred), roc_auc_score(y_valid, test_pred)))
+
+
+def toy_train():
+    def ks_stats(y_true, y_pred, **kwargs):
+        fpr, tpr, _ = roc_curve(y_true, y_pred, **kwargs)
+        ks_value = max(tpr - fpr)
+        return ks_value
+
+    def eval_ks(y_pred, y_true_dmatrix):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        def ks_stats(y_true, y_pred, **kwargs):
+            fpr, tpr, _ = roc_curve(y_true, y_pred, **kwargs)
+            ks_value = max(tpr - fpr)
+            return ks_value
+        y_true = y_true_dmatrix.get_label()
+        y_pred = special.expit(y_pred)
+        ks = ks_stats(y_true, y_pred)
+        return 'ks_score', ks, True
+
+    def eval_auc(y_pred, y_true_dmatrix):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        def auc_stats(y_true, y_pred, **kwargs):
+            auc = roc_auc_score(y_true, y_pred, **kwargs)
+            return auc
+        y_true = y_true_dmatrix.get_label()
+        y_pred = special.expit(y_pred)
+        auc = auc_stats(y_true, y_pred)
+        return 'auc_score', auc, True
+
+    from sklearn.datasets import load_breast_cancer
+    from sklearn.model_selection import train_test_split
+    X, y = load_breast_cancer(return_X_y=True)
+    x_train, x_valid, y_train, y_valid = train_test_split(X, y, random_state=0)
+
+    fl = FocalLoss(alpha=0.9, gamma=0.05)
+    fit = lgb.Dataset(x_train, y_train, init_score=np.full_like(y_train, fl.init_score(y_train), dtype=float))
+    val = lgb.Dataset(x_valid, y_valid, reference=fit, init_score=np.full_like(y_valid, fl.init_score(y_valid), dtype=float))
+
+    model = lgb.train(
+        params={
+            'verbosity': -1,
+            'learning_rate': 0.01,
+            'seed': 2021
+        },
+        train_set=fit,
+        num_boost_round=20,
+        valid_sets=(fit, val),
+        valid_names=('fit', 'val'),
+        early_stopping_rounds=5,
+        verbose_eval=1,
+        fobj=fl.get_loss,
+        feval=[fl.eval_focal_loss, eval_auc, eval_ks]
+    )
+    # init_score affects loss, but not ranking scores like auc and ks
+    logit = fl.init_score(y_valid) + model.predict(x_valid)
+    y_pred = special.expit(fl.init_score(y_valid) + model.predict(x_valid))
+    print("test loss {} ks {} auc {}".format(fl.eval_focal_loss(logit, val)[1], ks_stats(y_valid, y_pred), roc_auc_score(y_valid, y_pred)))
+
+
+def toy_cv():
+    def ks_stats(y_true, y_pred, **kwargs):
+        fpr, tpr, _ = roc_curve(y_true, y_pred, **kwargs)
+        ks_value = max(tpr - fpr)
+        return ks_value
+
+    def eval_ks(y_pred, y_true_dmatrix):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        def ks_stats(y_true, y_pred, **kwargs):
+            fpr, tpr, _ = roc_curve(y_true, y_pred, **kwargs)
+            ks_value = max(tpr - fpr)
+            return ks_value
+        y_true = y_true_dmatrix.get_label()
+        y_pred = special.expit(y_pred)
+        ks = ks_stats(y_true, y_pred)
+        return 'ks_score', ks, True
+
+    def eval_auc(y_pred, y_true_dmatrix):
+        # preds: If custom fobj is specified, predicted values are returned before any transformation,
+        # e.g. they are raw margin instead of probability of positive class for binary task in this case.
+        def auc_stats(y_true, y_pred, **kwargs):
+            auc = roc_auc_score(y_true, y_pred, **kwargs)
+            return auc
+        y_true = y_true_dmatrix.get_label()
+        y_pred = special.expit(y_pred)
+        auc = auc_stats(y_true, y_pred)
+        return 'auc_score', auc, True
+
+    from sklearn.datasets import load_breast_cancer
+    from sklearn.model_selection import train_test_split
+    X, y = load_breast_cancer(return_X_y=True)
+    x_train, x_valid, y_train, y_valid = train_test_split(X, y, random_state=0)
+
+    fl = FocalLoss(alpha=0.9, gamma=0.05)
+    x_train_val, y_train_val, cv, folds = make_train_val(x_train, y_train, [(x_valid, y_valid)], cv=1, random_state=5)
+    fit = lgb.Dataset(x_train_val, y_train_val, init_score=np.full_like(y_train_val, fl.init_score(y_train_val), dtype=float))
+    result = lgb.cv(
+        params={
+            'verbosity': -1,
+            'learning_rate': 0.01,
+            'seed': 2021
+        },
+        train_set=fit,
+        nfold=cv,
+        folds=folds,
+        num_boost_round=100,
+        early_stopping_rounds=20,
+        verbose_eval=True,
+        eval_train_metric=True,
+        return_cvbooster=True,
+        fobj=fl.get_loss,
+        feval=[fl.eval_focal_loss, eval_auc, eval_ks]
+    )
+    n_boosting = len(result['valid ks_score-mean'])
+    print(n_boosting)
+    train = lgb.Dataset(x_train, y_train, reference=fit,
+                        init_score=np.full_like(y_train, fl.init_score(y_train_val), dtype=float))
+    val = lgb.Dataset(x_valid, y_valid, reference=fit,
+                      init_score=np.full_like(y_valid, fl.init_score(y_train_val), dtype=float))
+    model = lgb.train(
+        params={
+            'verbosity': -1,
+            'learning_rate': 0.01,
+            'seed': 2021
+        },
+        train_set=train,
+        num_boost_round=n_boosting,
+        valid_sets=(train, val),
+        valid_names=('fit', 'val'),
+        verbose_eval=100,
+        fobj=fl.get_loss,
+        feval=[fl.eval_focal_loss, eval_auc, eval_ks]
+    )
+    # init_score affects loss, but not ranking scores like auc and ks
+    logit = fl.init_score(y_train_val) + model.predict(x_valid)
+    y_pred = special.expit(fl.init_score(y_train_val) + model.predict(x_valid))
+    print("test loss {} ks {} auc {}".format(fl.eval_focal_loss(logit, val)[1], ks_stats(y_valid, y_pred), roc_auc_score(y_valid, y_pred)))
+
+    # the booster returned is from the last iteration, not the best iteration
+    # init_score affects loss, but not ranking scores like auc and ks
+    model = result['cvbooster'].boosters[0]
+    logit = fl.init_score(y_train_val) + model.predict(x_valid)
+    y_pred = special.expit(fl.init_score(y_train_val) + model.predict(x_valid))
+    print("test loss {} ks {} auc {}".format(fl.eval_focal_loss(logit, val)[1], ks_stats(y_valid, y_pred), roc_auc_score(y_valid, y_pred)))
 
 
 if __name__ == '__main__':
