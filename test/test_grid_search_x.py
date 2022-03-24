@@ -299,3 +299,51 @@ def test_toy_reg_cv():
 
     y_pred = model.predict(x_valid)
     print("test mse {}".format(mean_squared_error(y_valid, y_pred)))
+
+
+def test_optuna_reg():
+    from sklearn.datasets import load_boston
+    from sklearn.model_selection import train_test_split
+    X, y = load_boston(return_X_y=True)
+    x_train, x_valid, y_train, y_valid = train_test_split(X, y, random_state=0)
+
+    x_train_val, y_train_val, cv, folds = make_train_val(x_train, y_train, [(x_valid, y_valid)], cv=1, random_state=5)
+    dmatrix = lgb.Dataset(x_train_val, label=y_train_val)
+    op = OptunaSearchLGB('l2',
+                         optimization_direction='minimize', coef_train_val_disparity=0,
+                         callbacks=[(my_early_stopping, {'stopping_rounds': 10, 'w': 0, 'verbose': True})],
+                         n_trials=3)
+    tuning_param_dict = {
+                         'objective': 'regression',
+                         'verbosity': 1,
+                         'seed': 2,
+                         'deterministic': True,
+                         'boosting': 'gbdt',
+                         'eta': ('discrete_uniform', {'low': 0.07, 'high': 1.2, 'q': 0.01}),
+                         'max_depth': ('int', {'low': 2, 'high': 6}),
+                         'reg_lambda': ('int', {'low': 1, 'high': 20}),
+                         'reg_alpha': ('int', {'low': 1, 'high': 20}),
+                         'min_gain_to_split': ('int', {'low': 0, 'high': 3}),
+                         'min_child_weight': ('int', {'low': 1, 'high': 30}),
+                         'colsample_bytree': ('discrete_uniform', {'low': 0.7, 'high': 1, 'q': 0.05}),
+                         'colsample_bynode': ('discrete_uniform', {'low': 0.7, 'high': 1, 'q': 0.05}),
+                         'subsample': ('discrete_uniform', {'low': 0.7, 'high': 0.95, 'q': 0.05}),
+                         'subsample_freq': ('int', {'low': 1, 'high': 10}),
+                         'rate_drop': ('float', {'low': 1e-8, 'high': 1.0, 'log': True}),
+                         'skip_drop': ('float', {'low': 1e-8, 'high': 1.0, 'log': True}),
+                         'uniform_drop': ('categorical', {'choices': [True, False]})
+    }
+    op.search(tuning_param_dict, dmatrix,
+              folds=folds, nfold=cv, shuffle=False, stratified=False)
+    train_param = op.get_params()
+    print(train_param)
+    train_dmatrix = lgb.Dataset(x_train, label=y_train, reference=dmatrix)
+    test_dmatrix = lgb.Dataset(x_valid, label=y_valid, reference=dmatrix)
+
+    afsxc = lgb.train(train_param[0], train_dmatrix,
+                      num_boost_round=train_param[2]['n_iterations'],
+                      valid_sets=[train_dmatrix, test_dmatrix], valid_names=['train', 'val'])
+    train_pred = afsxc.predict(x_train)
+    print("train l2 {}".format(mean_squared_error(y_train, train_pred)))
+    test_pred = afsxc.predict(x_valid)
+    print("test l2 {}".format(mean_squared_error(y_valid, test_pred)))
